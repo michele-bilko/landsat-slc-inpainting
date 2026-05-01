@@ -61,11 +61,10 @@ all four methods are evaluated on these same patches for the comparison table.
 
 - **PSNR** — Peak Signal-to-Noise Ratio, dB, higher is better
 - **SSIM** — Structural Similarity Index, 0–1, higher is better
-- **SAM** — Spectral Angle Mapper, radians, lower is better
-- **LPIPS** — Learned Perceptual Image Patch Similarity, lower is better
+- **CC** — Correlation Coefficient, 0–1, higher is better
+- **RNSE** — Root Mean Squared Error, normalized 0–1, lower is better
 
-All metrics are computed across the full patch (not gap-only) for consistency
-with the Pix2Pix baseline.
+All metrics are computed on the masked (gap) region only, evaluating reconstruction quality where data was missing.
 
 ## References
 
