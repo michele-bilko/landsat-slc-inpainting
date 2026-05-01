@@ -1,0 +1,47 @@
+data/
+sampled_patches/
+scenes/
+*.npy
+*.tar
+*.tif
+*.TIF
+*.tiff
+
+# CSVs that came from USGS — too big to track
+landsat_ot_c2_l1_*.csv
+
+# Generated images and viz
+*.png
+# But keep mask files since they define the experiment
+!mask.png
+!mask_thinned.png
+
+# Logs
+logs/
+*.log
+*.out
+*.err
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Environment / secrets
+.env
+.envrc
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+
+# OS
+Thumbs.db
