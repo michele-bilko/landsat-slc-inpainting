@@ -7,6 +7,10 @@ clean/corrupt subdirectories or clean/corrupt filename tokens are present.
 For the flat clean-only layout, mask.png is applied to generate the corrupt
 Pix2Pix input. White mask pixels are the hole/missing region.
 
+The Pix2Pix baseline is a single-channel model. RGB images are handled by
+running the same model independently on R, G, and B, then stacking the three
+predicted channels back into a color output image.
+
 Metrics:
   PSNR higher is better
   SSIM higher is better
@@ -156,13 +160,24 @@ def infer_flat_pairs(root: Path) -> tuple[dict[str, Path], dict[str, Path]]:
     return {}, {}
 
 
-def read_gray(path: Path) -> np.ndarray:
+def read_image(path: Path) -> np.ndarray:
     if path.suffix.lower() in (".tif", ".tiff"):
         arr = tifffile.imread(path)
     else:
-        arr = np.asarray(Image.open(path))
+        arr = np.asarray(Image.open(path).convert("RGB"))
+    arr = normalize_to_uint8(arr)
+    if arr.ndim == 2:
+        return arr
     if arr.ndim == 3:
-        arr = arr[..., :3].astype(np.float32).mean(axis=2)
+        return arr[..., :3]
+    raise ValueError(f"Unsupported image shape for {path}: {arr.shape}")
+
+
+def read_mask(path: Path) -> np.ndarray:
+    if path.suffix.lower() in (".tif", ".tiff"):
+        arr = tifffile.imread(path)
+    else:
+        arr = np.asarray(Image.open(path).convert("L"))
     return normalize_to_uint8(arr)
 
 
@@ -201,10 +216,16 @@ def resize_mask(mask: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return np.asarray(img) > 127
 
 
+def mask_for_image(mask: np.ndarray, image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        return mask
+    return np.repeat(mask[:, :, None], image.shape[2], axis=2)
+
+
 def masked_values(clean: np.ndarray, pred: np.ndarray, mask: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
     if mask is None:
         return clean.reshape(-1).astype(np.float32), pred.reshape(-1).astype(np.float32)
-    active = mask.reshape(-1)
+    active = mask_for_image(mask, clean).reshape(-1)
     return clean.reshape(-1).astype(np.float32)[active], pred.reshape(-1).astype(np.float32)[active]
 
 
@@ -219,12 +240,16 @@ def psnr(clean: np.ndarray, pred: np.ndarray, mask: np.ndarray | None) -> float:
 
 
 def ssim_metric(clean: np.ndarray, pred: np.ndarray, mask: np.ndarray | None) -> float:
-    score, ssim_map = structural_similarity(clean, pred, data_range=DATA_RANGE, full=True)
+    kwargs: dict[str, Any] = {}
+    if clean.ndim == 3:
+        kwargs["channel_axis"] = -1
+    score, ssim_map = structural_similarity(clean, pred, data_range=DATA_RANGE, full=True, **kwargs)
     if mask is None:
         return float(score)
     if not np.any(mask):
         return math.nan
-    return float(np.mean(ssim_map[mask]))
+    active = mask_for_image(mask, ssim_map) if ssim_map.ndim == 3 else mask
+    return float(np.mean(ssim_map[active]))
 
 
 def cc(clean: np.ndarray, pred: np.ndarray, mask: np.ndarray | None) -> float:
@@ -258,7 +283,10 @@ def save_grid(path: Path, clean: np.ndarray, corrupt: np.ndarray, pred: np.ndarr
         (mask.astype(np.uint8) * 255, "Mask"),
     )
     for ax, (arr, title) in zip(axes, items):
-        ax.imshow(arr, cmap="gray", vmin=0, vmax=255)
+        if arr.ndim == 2:
+            ax.imshow(arr, cmap="gray", vmin=0, vmax=255)
+        else:
+            ax.imshow(arr, vmin=0, vmax=255)
         ax.set_title(title)
         ax.axis("off")
     fig.savefig(path, dpi=160)
@@ -280,6 +308,23 @@ def metric_row(prefix: str, clean: np.ndarray, pred: np.ndarray, mask: np.ndarra
     }
 
 
+def predict_color_image(
+    model: Any,
+    image: np.ndarray,
+    model_h: int | None,
+    model_w: int | None,
+    expects_channel: bool,
+) -> np.ndarray:
+    if image.ndim == 2:
+        return predict_image(model, image, model_h, model_w, expects_channel)
+
+    channels = []
+    for c in range(image.shape[2]):
+        pred_c = predict_image(model, image[..., c], model_h, model_w, expects_channel)
+        channels.append(pred_c)
+    return np.stack(channels, axis=2)
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -299,7 +344,7 @@ def main() -> None:
     model_path = args.model_path or (args.models_dir / MODEL_PATHS[args.model_key])
     model = load_inference_model(model_path)
     model_h, model_w, expects_channel = model_input_spec(model)
-    mask_base = read_gray(mask_path) > 127
+    mask_base = read_mask(mask_path) > 127
 
     rows: list[dict[str, Any]] = []
     with manifest_csv.open("w", newline="") as mf:
@@ -310,20 +355,23 @@ def main() -> None:
         manifest_writer.writeheader()
 
         for idx, image_id in enumerate(tqdm(common, desc=f"Pix2Pix {args.model_key}")):
-            clean = read_gray(clean_map[image_id])
-            mask = resize_mask(mask_base, clean.shape)
+            clean = read_image(clean_map[image_id])
+            mask = resize_mask(mask_base, clean.shape[:2])
             if generated_corrupt:
                 corrupt = clean.copy()
-                corrupt[mask] = 0
+                if corrupt.ndim == 2:
+                    corrupt[mask] = 0
+                else:
+                    corrupt[mask, :] = 0
                 corrupt_path = corrupt_out_dir / f"{image_id}_corrupt.png"
                 write_png(corrupt_path, corrupt)
             else:
-                corrupt = read_gray(corrupt_map[image_id])
+                corrupt = read_image(corrupt_map[image_id])
                 corrupt_path = corrupt_map[image_id]
                 if clean.shape != corrupt.shape:
                     raise ValueError(f"Shape mismatch for {image_id}: clean {clean.shape}, corrupt {corrupt.shape}")
 
-            pred = predict_image(model, corrupt, model_h, model_w, expects_channel)
+            pred = predict_color_image(model, corrupt, model_h, model_w, expects_channel)
             pred = np.clip(pred, 0, 255).astype(np.uint8)
             pred_path = pred_dir / f"{image_id}.png"
             write_png(pred_path, pred)
@@ -332,6 +380,7 @@ def main() -> None:
                 "image_id": image_id,
                 "height": clean.shape[0],
                 "width": clean.shape[1],
+                "channels": 1 if clean.ndim == 2 else clean.shape[2],
                 "mask_fraction": float(mask.mean()),
             }
             row.update(metric_row("pix2pix_full", clean, pred, None))
